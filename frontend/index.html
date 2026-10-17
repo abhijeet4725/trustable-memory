@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Trustable Memory — Graph Dashboard</title>
+  <!-- Vis.js Network from unpkg CDN -->
+  <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+  <style>
+    :root {
+      --bg-dark: #0f172a;
+      --card-bg: #1e293b;
+      --card-border: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --active-green: #22c55e;
+      --quarantine-red: #ef4444;
+      --retracted-darkred: #b91c1c;
+      --primary-blue: #3b82f6;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { background-color: var(--bg-dark); color: var(--text-main); height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+    /* Top Navigation */
+    header {
+      background: var(--card-bg);
+      border-bottom: 1px solid var(--card-border);
+      padding: 12px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      z-index: 10;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; }
+    .brand h1 { font-size: 1.15rem; font-weight: 700; color: #fff; letter-spacing: -0.5px; }
+    .badge { font-size: 0.75rem; background: #2563eb; color: #fff; padding: 3px 8px; border-radius: 999px; font-weight: 600; }
+    
+    .controls { display: flex; align-items: center; gap: 12px; }
+    .controls label { font-size: 0.85rem; color: var(--text-muted); }
+    .controls input, .controls select {
+      background: #0f172a;
+      border: 1px solid var(--card-border);
+      color: #fff;
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+    }
+    .btn {
+      background: var(--primary-blue);
+      color: #fff;
+      border: none;
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+    .btn:hover { background: #2563eb; }
+    .btn-danger { background: var(--quarantine-red); }
+    .btn-danger:hover { background: var(--retracted-darkred); }
+    .btn-outline { background: transparent; border: 1px solid var(--card-border); }
+    .btn-outline:hover { background: #334155; }
+
+    /* Main Workspace Layout */
+    .workspace { display: flex; flex: 1; position: relative; overflow: hidden; }
+
+    /* Graph Canvas */
+    #network-container { flex: 1; height: 100%; background: radial-gradient(circle at center, #1e293b 0%, #0f172a 100%); }
+
+    /* Legend Overlay */
+    .legend {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      background: rgba(30, 41, 59, 0.9);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 0.8rem;
+      z-index: 5;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .legend-item { display: flex; align-items: center; gap: 8px; }
+    .legend-dot { width: 12px; height: 12px; border-radius: 50%; }
+
+    /* Sidebar Inspector */
+    .sidebar {
+      width: 380px;
+      background: var(--card-bg);
+      border-left: 1px solid var(--card-border);
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+      z-index: 10;
+    }
+    .panel-header {
+      padding: 16px;
+      border-bottom: 1px solid var(--card-border);
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: #fff;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .panel-body { padding: 16px; display: flex; flex-direction: column; gap: 14px; font-size: 0.85rem; }
+    .info-group { display: flex; flex-direction: column; gap: 4px; }
+    .info-label { color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; font-weight: 700; }
+    .info-value { background: #0f172a; padding: 8px 10px; border-radius: 6px; border: 1px solid #334155; word-break: break-word; }
+    .blast-list { list-style: none; display: flex; flex-direction: column; gap: 6px; max-height: 180px; overflow-y: auto; }
+    .blast-item {
+      background: #0f172a;
+      border-left: 3px solid var(--quarantine-red);
+      padding: 6px 10px;
+      border-radius: 4px;
+      font-size: 0.8rem;
+    }
+
+    /* Benchmark Bottom Drawer */
+    .benchmark-drawer {
+      background: var(--card-bg);
+      border-top: 1px solid var(--card-border);
+      transition: height 0.3s ease;
+      height: 40px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .benchmark-drawer.expanded { height: 260px; }
+    .drawer-toggle {
+      padding: 10px 24px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      font-weight: 700;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: #1e293b;
+      user-select: none;
+    }
+    .drawer-content { flex: 1; overflow-y: auto; padding: 16px 24px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.8rem; text-align: left; }
+    th { background: #0f172a; color: var(--text-muted); padding: 8px 12px; border-bottom: 1px solid var(--card-border); font-weight: 600; }
+    td { padding: 8px 12px; border-bottom: 1px solid #283548; color: var(--text-main); }
+    tr:hover td { background: #26354a; }
+  </style>
+</head>
+<body>
+
+  <!-- Top Navigation -->
+  <header>
+    <div class="brand">
+      <span style="font-size: 1.3rem;">🛡️</span>
+      <h1>Trustable Memory</h1>
+      <span class="badge">Ops Agent Provenance</span>
+    </div>
+
+    <div class="controls">
+      <label for="tenantInput">Tenant:</label>
+      <input type="text" id="tenantInput" value="demo" style="width: 110px;" />
+      <button class="btn btn-outline" onclick="loadGraph()">Load Graph</button>
+      <button class="btn btn-outline" onclick="seedDemo()">Reset Demo</button>
+    </div>
+  </header>
+
+  <!-- Workspace -->
+  <div class="workspace">
+    <!-- Visual Graph -->
+    <div id="network-container"></div>
+
+    <!-- Graph Legend -->
+    <div class="legend">
+      <div class="legend-item"><div class="legend-dot" style="background: var(--active-green);"></div> Active (Trusted)</div>
+      <div class="legend-item"><div class="legend-dot" style="background: var(--quarantine-red);"></div> Quarantined</div>
+      <div class="legend-item"><div class="legend-dot" style="background: var(--retracted-darkred);"></div> Retracted (Poison Root)</div>
+      <div class="legend-item"><div class="legend-dot" style="background: #3b82f6;"></div> Agent / Source</div>
+    </div>
+
+    <!-- Inspector Sidebar -->
+    <div class="sidebar" id="sidebar">
+      <div class="panel-header">
+        <span>Node Inspector</span>
+        <span id="nodeStatusBadge" style="font-size: 0.75rem; padding: 2px 6px; border-radius: 4px;">Click a node</span>
+      </div>
+      <div class="panel-body" id="panelBody">
+        <p style="color: var(--text-muted); font-size: 0.85rem;">
+          Click any <strong>Memory</strong> node to inspect its provenance and blast radius, or quarantine it.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Benchmark Bottom Drawer -->
+  <div class="benchmark-drawer" id="benchDrawer">
+    <div class="drawer-toggle" onclick="toggleDrawer()">
+      <span>📊 Attack Benchmark Results (M3)</span>
+      <span id="drawerToggleIcon">▲ Click to Expand</span>
+    </div>
+    <div class="drawer-content">
+      <table>
+        <thead>
+          <tr>
+            <th>Attack Scenario</th>
+            <th>Expected Catch?</th>
+            <th>Baseline Recovered</th>
+            <th>Graph Recovered</th>
+            <th>False Quarantines</th>
+            <th>Outcome & Honest Notes</th>
+          </tr>
+        </thead>
+        <tbody id="benchmarkTableBody">
+          <tr><td colspan="6" style="text-align: center; color: var(--text-muted);">Loading benchmark results...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    let network = null;
+    let currentTenant = "demo";
+    let selectedNodeData = null;
+
+    async function loadGraph() {
+      currentTenant = document.getElementById("tenantInput").value.trim() || "demo";
+      try {
+        const res = await fetch(`/tenants/${currentTenant}/graph`);
+        if (!res.ok) throw new Error("Failed to load graph");
+        const data = await res.json();
+        renderVisGraph(data);
+      } catch (err) {
+        alert("Error loading graph: " + err.message);
+      }
+    }
+
+    function renderVisGraph(data) {
+      const container = document.getElementById("network-container");
+
+      const nodes = new vis.DataSet(data.nodes.map(n => {
+        let color = "#3b82f6";
+        let shape = "box";
+
+        if (n.kind === "Memory") {
+          shape = "box";
+          color = (n.status === "active") ? "#22c55e" : ((n.status === "retracted") ? "#b91c1c" : "#ef4444");
+        } else if (n.kind === "Output") {
+          shape = "ellipse";
+          color = (n.status === "active") ? "#16a34a" : "#dc2626";
+        } else if (n.kind === "Agent") {
+          shape = "diamond";
+          color = "#6366f1";
+        } else if (n.kind === "Source") {
+          shape = "database";
+          color = "#0ea5e9";
+        }
+
+        return {
+          id: n.id,
+          label: n.label,
+          color: { background: color, border: "#ffffff", highlight: { background: "#f59e0b", border: "#fff" } },
+          shape: shape,
+          font: { color: "#ffffff", size: 12, face: "monospace" },
+          rawNode: n
+        };
+      }));
+
+      const edges = new vis.DataSet(data.edges.map((e, idx) => ({
+        id: "e" + idx,
+        from: e.from,
+        to: e.to,
+        label: e.label,
+        arrows: "to",
+        color: { color: "#64748b", highlight: "#f59e0b" },
+        font: { color: "#94a3b8", size: 9, align: "middle" }
+      })));
+
+      const options = {
+        physics: {
+          stabilization: true,
+          barnesHut: { gravitationalConstant: -3500, springLength: 95 }
+        },
+        interaction: { hover: true, tooltipDelay: 200 }
+      };
+
+      if (network) network.destroy();
+      network = new vis.Network(container, { nodes, edges }, options);
+
+      network.on("click", async function (params) {
+        if (params.nodes.length > 0) {
+          const nodeId = params.nodes[0];
+          const node = nodes.get(nodeId);
+          await selectNode(node.rawNode);
+        }
+      });
+    }
+
+    async function selectNode(node) {
+      selectedNodeData = node;
+      const body = document.getElementById("panelBody");
+      const badge = document.getElementById("nodeStatusBadge");
+
+      badge.innerText = (node.status || "ACTIVE").toUpperCase();
+      badge.style.background = node.status === "active" ? "#16a34a" : "#dc2626";
+
+      let html = `
+        <div class="info-group">
+          <span class="info-label">Node Type</span>
+          <div class="info-value"><strong>${node.kind}</strong> (${node.id.slice(0, 12)}...)</div>
+        </div>
+        <div class="info-group">
+          <span class="info-label">Detail / Content</span>
+          <div class="info-value" style="font-size: 0.8rem; line-height: 1.4;">${escapeHtml(node.detail || "N/A")}</div>
+        </div>
+      `;
+
+      if (node.kind === "Memory") {
+        html += `
+          <div class="info-group">
+            <span class="info-label">Trust Score</span>
+            <div class="info-value">${node.trust !== null ? node.trust : "1.0"}</div>
+          </div>
+          <div id="blastRadiusSection">
+            <span class="info-label">Downstream Blast Radius</span>
+            <div id="blastRadiusContainer" style="margin-top: 6px;">
+              <span style="color: var(--text-muted); font-size: 0.75rem;">Loading traversal...</span>
+            </div>
+          </div>
+          <button class="btn btn-danger" style="margin-top: 8px;" onclick="retractCurrentMemory('${node.id}')">
+            🚨 Retract & Cascade Quarantine
+          </button>
+        `;
+      }
+
+      body.innerHTML = html;
+
+      if (node.kind === "Memory") {
+        try {
+          const brRes = await fetch(`/tenants/${currentTenant}/memories/${node.id}/blast-radius`);
+          if (brRes.ok) {
+            const br = await brRes.json();
+            const brDiv = document.getElementById("blastRadiusContainer");
+            if (br.total_affected === 0) {
+              brDiv.innerHTML = `<span style="color: #22c55e; font-size: 0.8rem;">No downstream dependents (leaf node).</span>`;
+            } else {
+              let listHtml = `<ul class="blast-list">`;
+              br.affected_memories.forEach(id => {
+                listHtml += `<li class="blast-item"><strong>Memory</strong>: ${id.slice(0, 8)}...</li>`;
+              });
+              br.affected_outputs.forEach(id => {
+                listHtml += `<li class="blast-item"><strong>Output</strong>: ${id.slice(0, 8)}...</li>`;
+              });
+              listHtml += `</ul><div style="font-size: 0.75rem; color: #f59e0b; margin-top: 4px;">Total impact: ${br.total_affected} nodes</div>`;
+              brDiv.innerHTML = listHtml;
+            }
+          }
+        } catch (e) {
+          console.error(e);
+        }
+      }
+    }
+
+    async function retractCurrentMemory(memoryId) {
+      if (!confirm(`Are you sure you want to retract Memory ${memoryId.slice(0, 8)}? This will cascade-quarantine all downstream nodes!`)) return;
+
+      try {
+        const res = await fetch(`/tenants/${currentTenant}/memories/${memoryId}/retract`, { method: "POST" });
+        if (!res.ok) throw new Error("Retraction failed");
+        const data = await res.json();
+        alert(`Success! Retracted root memory.\nQuarantined: ${data.memories_quarantined} memories, ${data.outputs_quarantined} outputs.`);
+        await loadGraph();
+      } catch (err) {
+        alert("Error: " + err.message);
+      }
+    }
+
+    async function loadBenchmarkTable() {
+      try {
+        const res = await fetch("/benchmark/results");
+        if (!res.ok) return;
+        const data = await res.json();
+        const tbody = document.getElementById("benchmarkTableBody");
+        if (!data.rows || data.rows.length === 0) {
+          tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-muted);">No benchmark results yet. Run: python -m benchmark.run_benchmark</td></tr>`;
+          return;
+        }
+
+        tbody.innerHTML = data.rows.map(r => {
+          const isCaught = r.expected_to_be_caught === "True";
+          const graphRec = parseInt(r.graph_recovered || 0);
+          const badgeColor = isCaught ? (graphRec > 0 ? "#16a34a" : "#dc2626") : "#94a3b8";
+          const statusText = isCaught ? (graphRec > 0 ? "PASSED (2/2)" : "FAILED") : "EXPECTED MISS";
+
+          return `
+            <tr>
+              <td><strong>${escapeHtml(r.attack_name)}</strong></td>
+              <td>${isCaught ? '<span style="color: #22c55e;">YES</span>' : '<span style="color: #f59e0b;">NO</span>'}</td>
+              <td>${r.baseline_recovered} / 2</td>
+              <td><span style="color: #22c55e; font-weight: 700;">${r.graph_recovered} / 2</span></td>
+              <td>${r.graph_false_quarantines}</td>
+              <td><span style="background: ${badgeColor}; padding: 2px 6px; border-radius: 4px; font-size: 0.7rem; font-weight: 700; color: #fff;">${statusText}</span> ${escapeHtml(r.notes || '')}</td>
+            </tr>
+          `;
+        }).join("");
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    function toggleDrawer() {
+      const drawer = document.getElementById("benchDrawer");
+      const icon = document.getElementById("drawerToggleIcon");
+      drawer.classList.toggle("expanded");
+      icon.innerText = drawer.classList.contains("expanded") ? "▼ Click to Collapse" : "▲ Click to Expand";
+    }
+
+    async function seedDemo() {
+      alert("To reload demo dataset into 'demo' tenant, run: python seed.py --reset in your terminal.");
+      await loadGraph();
+    }
+
+    function escapeHtml(str) {
+      return (str || '').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    window.addEventListener("DOMContentLoaded", () => {
+      loadGraph();
+      loadBenchmarkTable();
+    });
+  </script>
+</body>
+</html>
