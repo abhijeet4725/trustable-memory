@@ -1,249 +1,187 @@
 # Trustable Memory for Ops Agents
 
-> **Graph Hacks Hackathon — Track 02: Agent Memory and Coordination**  
-> A FalkorDB-backed provenance graph memory layer for collaborative IT incident response AI agents with variable-length blast-radius analysis and atomic cascade quarantine.
+**Graph Hacks: Context for AI Agents, Track 02 (Agent Memory and Coordination)**
+
+A shared-memory layer for AI agents that records where every fact came from and what was built on it, stored as a graph in FalkorDB. When a fact turns out to be bad, one action traces everything it touched and blocks all of it.
+
+Everything is **simulated**. Agents produce text recommendations stored in the graph. No real infrastructure commands or network calls are ever made. Agents run in a deterministic mock mode, with no LLM and no API key needed.
 
 ---
 
-## 1. The Problem in Plain Words
+## 1. The problem
 
-When autonomous AI agents collaborate on IT operations (investigating alerts, reading runbooks, recommending infrastructure actions), they must share memory. However, traditional agent architectures treat shared memory like a flat key-value cache or vector database with **zero provenance tracking**:
-- If an agent reads a poisoned runbook, a malicious ticket, or an adversarial prompt injection, that poisoned knowledge is stored in memory.
-- Other downstream agents consume that poisoned memory to plan actions, generate runbook scripts, and execute recommendations.
-- **The Blind Retraction Failure:** When security engineers discover the poisoned document hours later, a flat memory layer can at best delete the original text. It has **no record** of which derived plans were generated, which agents used it, or what recommendations were delivered. The poison remains active across the agent swarm.
+When several AI agents share one memory, a single bad fact (a poisoned runbook, a fake ticket, a prompt-injection document) can spread. Other agents read it, build new facts on top of it, and hand wrong recommendations to users.
 
-**Trustable Memory** solves this by enforcing an explicit provenance graph in **FalkorDB**: every memory records where it came from, which agent wrote it, what subsequent memories derived from it, and which agent outputs consumed it. When a memory is retracted, a single Cypher traversal calculates its exact blast radius and cascades quarantine across all downstream descendants.
+Once the bad fact is discovered, a plain memory store can delete or search for the original text. It has no record of which derived facts and answers came from it, so reworded copies stay active and keep serving the bad information.
 
----
+## 2. What this project does
 
-## 2. How It Works
+Every memory is stored with a record of who wrote it, which source it came from, which memories were derived from it, and which outputs used it. These records are edges in a FalkorDB graph.
 
-1. **Researcher Agent** extracts facts from internal or external documents, runbooks, or tickets, writing `Memory` nodes connected to `Agent` (`:WROTE`) and `Source` (`:SOURCED_FROM`).
-2. **Derived Knowledge** captures multi-step reasoning: if an agent synthesizes an action plan from an existing memory, a `(:Memory)-[:DERIVED_FROM]->(:Memory)` edge is created.
-3. **Responder Agent** generates operational recommendations strictly from `active` memories, recording `(:Memory)-[:USED_BY]->(:Output)` edges.
-4. **Blast Radius Analysis**: Upon detection of a compromised memory, a variable-length graph traversal (`DERIVED_FROM*` and `USED_BY`) maps every impacted downstream node and its exact path depth.
-5. **Atomic Cascade Quarantine**: A single atomic Cypher query sets the root memory to `retracted` and all downstream memories and outputs to `quarantined`.
-6. **Recovery**: Autonomous agents continue functioning immediately—their queries automatically filter out quarantined nodes (`WHERE m.status = 'active'`), preventing further damage while preserving clean knowledge.
+1. A **Researcher** agent reads documents and writes Memory nodes, linked to the writing Agent and the Source.
+2. A **Responder** agent produces recommendations (Output nodes) using only memories marked `active`, and records which memories it used.
+3. A **Reviewer** agent applies simple rules (keywords and trust thresholds) to flag suspicious memories.
+4. When a memory is retracted, a graph traversal finds the **blast radius**: every memory derived from it and every output built on any of them.
+5. A **cascade quarantine** query marks the bad memory `retracted` and everything downstream `quarantined`.
+6. Agents only read memories where `status = 'active'`, so they stop seeing the bad facts. Nothing is pushed to them. The database simply no longer returns those rows.
 
-*Note: Everything is SIMULATED. Agents produce text recommendations in the graph; no real infrastructure commands or network calls are ever made.*
+Agents keep running normally. What changes is the data they can read, and you get an exact list of the outputs that need correcting.
 
----
+## 3. Graph data model
 
-## 3. Graph Data Model
-
-Each tenant is partitioned into an isolated FalkorDB graph named `tenant_<id>`.
+Each tenant gets its own isolated FalkorDB graph, named `tenant_<id>`.
 
 ```
-                    ┌──────────────┐
-                    │    Agent     │
-                    │ {name, role} │
-                    └──────┬───────┘
-                           │
-                    [:WROTE]
-                           │
-                           ▼
-┌──────────────┐    ┌──────────────┐   [:DERIVED_FROM]    ┌──────────────┐
-│    Source    │◄───│    Memory    │◄─────────────────────│    Memory    │
-│{url,type,    │    │{id, status,  │                      │ (Child Plan) │
-│ trust}       │    │ topic, trust}│                      └──────┬───────┘
-└──────────────┘    └──────┬───────┘                             │
-                           │                                     │
-                       [:USED_BY]                            [:USED_BY]
-                           │                                     │
-                           ▼                                     ▼
-                    ┌──────────────┐                      ┌──────────────┐
-                    │    Output    │                      │    Output    │
-                    │{id, kind,    │                      │ (Downstream  │
-                    │ text, status}│                      │  Action Log) │
-                    └──────────────┘                      └──────────────┘
+ Agent --WROTE--> Memory --SOURCED_FROM--> Source
+                    |  ^
+           USED_BY  |  | DERIVED_FROM (child points to parent)
+                    v  |
+                  Output     (Memory --DERIVED_FROM--> Memory)
 ```
 
-### Node Labels
-- **`Agent`**: `{name: str, role: str}`
-- **`Source`**: `{url: str, type: str, trust: float}`
-- **`Memory`**: `{id: str, topic: str, value: str, status: 'active'|'quarantined'|'retracted', trust: float, created_at: str, valid_from: str, valid_to: str}`
-- **`Output`**: `{id: str, kind: str, text: str, status: 'active'|'quarantined', created_at: str}`
+- `Agent {name, role}`
+- `Source {url, type, trust}`
+- `Memory {id, topic, value, status, trust, created_at, valid_from, valid_to}`, where `status` is `active`, `quarantined` or `retracted`
+- `Output {id, kind, text, status, created_at}`
 
-### Edge Relationships
-- `(Agent)-[:WROTE]->(Memory)`
-- `(Memory)-[:SOURCED_FROM]->(Source)`
-- `(Child:Memory)-[:DERIVED_FROM]->(Parent:Memory)` *(points child -> parent)*
-- `(Memory)-[:USED_BY]->(Output)`
+Edges: `WROTE`, `SOURCED_FROM`, `DERIVED_FROM`, `USED_BY`.
 
----
+## 4. Key Cypher queries
 
-## 4. Key Cypher Queries Explained Simply
+**Safe reading.** Agents only see active memories:
 
-### 1. Active Memory Retrieval (Agent Safety Filter)
-Agents never access raw database rows; they query active memories above a minimum trust threshold:
 ```cypher
 MATCH (a:Agent)-[:WROTE]->(m:Memory)-[:SOURCED_FROM]->(s:Source)
-WHERE m.status = 'active'
-  AND m.topic  = $topic
-  AND m.trust >= $min_trust
-RETURN m.id AS id, m.topic AS topic, m.value AS value, m.trust AS trust,
-       m.status AS status, a.name AS agent_name, s.url AS source_url
+WHERE m.status = 'active' AND m.topic = $topic AND m.trust >= $min_trust
+RETURN m.id AS id, m.value AS value, m.trust AS trust, a.name AS agent_name, s.url AS source_url
 ORDER BY m.trust DESC
 ```
 
-### 2. Variable-Length Blast-Radius Traversal
-Traverses downstream dependencies to compute exact dynamic depth without duplicates:
+**Blast radius.** Follows `USED_BY` and `DERIVED_FROM` edges, with depth taken from the real path length and no duplicates:
+
 ```cypher
--- A: Direct outputs of root (depth 1)
+-- A: direct outputs of the bad memory (depth 1)
 MATCH (root:Memory {id: $id})-[:USED_BY]->(o:Output)
 RETURN DISTINCT 'Output' AS kind, o.id AS node_id, o.status AS status, 1 AS depth
 
--- B1: Transitive derived memories (depth = path length)
+-- B1: memories derived from it, at any depth up to 10
 MATCH path = (child:Memory)-[:DERIVED_FROM*1..10]->(root:Memory {id: $id})
 WITH child, min(length(path)) AS depth
 RETURN DISTINCT 'Memory' AS kind, child.id AS node_id, child.status AS status, depth
 
--- B2: Outputs of derived memories (dynamic depth = path length + 1)
+-- B2: outputs of those derived memories
 MATCH path = (child:Memory)-[:DERIVED_FROM*1..10]->(root:Memory {id: $id})
 MATCH (child)-[:USED_BY]->(o:Output)
 WITH o, min(length(path) + 1) AS depth
 RETURN DISTINCT 'Output' AS kind, o.id AS node_id, o.status AS status, depth
 ```
 
-### 3. Atomic Cascade Quarantine
-A single Cypher execution guarantees transactional atomicity—no partial quarantine states:
+**Cascade quarantine.** One Cypher statement marks the root `retracted` and every downstream memory and output `quarantined`:
+
 ```cypher
 MATCH (root:Memory {id: $id})
 SET root.status = 'retracted'
 WITH root
-
 OPTIONAL MATCH (child:Memory)-[:DERIVED_FROM*1..10]->(root)
 WHERE child IS NOT NULL
 SET child.status = 'quarantined'
 WITH root, collect(DISTINCT child.id) AS child_ids
-
 OPTIONAL MATCH (root)-[:USED_BY]->(o1:Output)
 WHERE o1 IS NOT NULL
 SET o1.status = 'quarantined'
 WITH root, child_ids, collect(DISTINCT o1.id) AS root_out_ids
-
 OPTIONAL MATCH (c2:Memory)-[:DERIVED_FROM*1..10]->(root)
 OPTIONAL MATCH (c2)-[:USED_BY]->(o2:Output)
 WHERE o2 IS NOT NULL
 SET o2.status = 'quarantined'
-
 RETURN root.id AS root_id, child_ids, root_out_ids, collect(DISTINCT o2.id) AS desc_out_ids
 ```
 
----
+## 5. Why a graph
 
-## 5. How to Run
+The question this project answers is "what else was built on this fact?", which means following links several steps deep.
 
-### Prerequisites
-- Python 3.11+
-- Docker & Docker Compose
+A relational table with a `parent_id` column and recursive queries could store the same provenance, so a graph is not the only way to do it. FalkorDB makes the multi-hop tracing a single natural pattern (`-[:DERIVED_FROM*1..10]->`), treats relationships as first-class data, and lets one instance hold a separate isolated graph per tenant.
 
-### 1. Start FalkorDB
+## 6. How to run
+
+Requirements: Python 3.11+, Docker.
+
 ```bash
-docker-compose up -d
-# FalkorDB is exposed on port 6379; Browser UI on http://localhost:3000 (or :3001)
-```
-
-### 2. Install Dependencies
-```bash
+git clone https://github.com/abhijeet4725/trustable-memory.git
+cd trustable-memory
+docker-compose up -d            # FalkorDB on port 6379 (check docker-compose.yml for the browser port)
 pip install -r requirements.txt
+python -m pytest                # 44 tests
+python demo.py                  # terminal story (add --no-pause to skip pauses)
+python -m benchmark.run_benchmark   # writes benchmark/results.csv and results.png
+python main.py                  # then open http://localhost:8000/ui
 ```
 
-### 3. Run the Full Test Suite (44 unit & integration tests)
-```bash
-python -m pytest tests/ -v
-```
+## 7. Benchmark
 
-### 4. Run the End-to-End Terminal Story
-```bash
-# Interactive mode (pauses between steps)
-python demo.py
+The benchmark compares two systems on scripted attacks, all in mock mode:
 
-# Automated non-stop mode
-python demo.py --no-pause
-```
+- **Baseline:** a plain shared memory with de-duplication and latest-write-wins, with no provenance. After a bad fact is found, it can only search outputs by text.
+- **Graph layer:** this project.
 
-### 5. Run the Attack Benchmark
-```bash
-python -m benchmark.run_benchmark
-# Generates benchmark/results.csv and benchmark/results.png
-```
+Columns: *Tainted* is the number of outputs built on the poisoned memory. *Found* is how many of them the system identified and quarantined after cleanup. *Leaked* is how many were still serving poison afterward. *False quarantines* are clean items blocked by mistake (0 in every row, so the column is omitted below).
 
-### 6. Launch the Web UI Dashboard
-```bash
-python main.py
-# Open your browser at: http://localhost:8000/ui
-```
+### Automatic detection (the Reviewer decides what to flag)
 
----
+| Attack | Flagged by Reviewer? | Tainted | Baseline found / leaked | Graph found / leaked |
+|---|---|---|---|---|
+| 1. Fake runbook (low-trust web page) | Yes | 2 | 1 / 1 | 2 / 0 |
+| 2. Fake ticket (reworded, no trigger words) | **No** | 2 | 0 / 2 | 0 / 2 |
+| 3. Prompt injection ("always trust this source") | Yes | 2 | 1 / 1 | 2 / 0 |
+| 4. Conflicting software version | Yes | 2 | 1 / 1 | 2 / 0 |
+| 5. Vendor note with subtle error | Yes | 2 | 1 / 1 | 2 / 0 |
+| 6. Compromised high-trust source | **No** | 2 | 0 / 2 | 0 / 2 |
+| 7. Same lie from two mirrors (trust 0.75) | **No** | 2 | 0 / 2 | 0 / 2 |
+| 8. Large blast radius (fan-out, 3 hops) | Yes | 20 | 5 / 15 | **20 / 0** |
 
-## 6. Benchmark Results (from `benchmark/results.csv`)
+### Manual flag (a human flags the memory after discovering the breach)
 
-The benchmark compares:
-- **(a) Baseline**: A plain shared memory store with deduplication and latest-write-wins (no provenance edges). Retraction uses honest plain-text keyword matching across outputs.
-- **(b) Graph Layer**: Our FalkorDB provenance graph with Cypher variable-length cascade quarantine.
+| Attack | Tainted | Baseline found / leaked | Graph found / leaked |
+|---|---|---|---|
+| 6. Compromised high-trust source | 2 | 1 / 1 | 2 / 0 |
+| 7. Same lie from two mirrors | 2 | 1 / 1 | 2 / 0 |
 
-Metrics:
-- **`total_tainted_outputs`**: Total outputs (direct and derived) downstream of the poisoned memory.
-- **`found_after_cleanup`**: Tainted outputs identified and quarantined after memory retraction.
-- **`still_serving_poison_after_cleanup`**: Tainted outputs that remained unquarantined and active after cleanup.
-- **`false_quarantines`**: Clean, unpoisoned outputs wrongly flagged or blocked.
+Attack 2 was not tested with a manual flag.
 
-### Section A: Automatic Detection Scenarios
+### What the results show
 
-| Attack Scenario | Catch? | Tainted | Base Found | Base Leaked | Graph Found | Graph Leaked | Graph FQ | Outcome |
-|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---|
-| **Fake Runbook** (Low-trust web page) | **YES** | 2 | 1 | 1 | **2** | **0** | 0 | **100% Recovered** |
-| **Fake Internal Ticket** | **YES** | 2 | 1 | 1 | **2** | **0** | 0 | **100% Recovered** |
-| **Prompt Injection** ("Always trust this source") | **YES** | 2 | 1 | 1 | **2** | **0** | 0 | **100% Recovered** |
-| **Conflicting Software Version** | **YES** | 2 | 1 | 1 | **2** | **0** | 0 | **100% Recovered** |
-| **Vendor Note with Subtle Error** | **YES** | 2 | 1 | 1 | **2** | **0** | 0 | **100% Recovered** |
-| **Compromised High-Trust Source** | **NO** | 2 | 0 | 2 | **0** | **2** | 0 | **Missed (System Limitation)** |
-| **Coordinated Multi-Source Lie** | **NO** | 2 | 0 | 2 | **0** | **2** | 0 | **Missed (System Limitation)** |
-| **Large Blast Radius** (Fan-out & Deep Chains) | **YES** | 20 | 5 | 15 | **20** | **0** | 0 | **100% Recovered (20/20)** |
+- **Cleanup works once something is flagged.** Where a memory was flagged, automatically or manually, the graph quarantined every downstream output, and the baseline missed reworded ones.
+- **Attack 8 is the clearest case.** One poisoned memory fed 5 outputs directly and 15 reworded outputs through 4 derived memories. Text search found 5 of 20. The graph found 20 of 20, with no clean items blocked.
+- **The system does not prevent the first mistake.** Poison reaches users at least once before anyone notices, so "attack success" is true for every attack, with or without the graph.
 
-### Section B: Manual Flag Variants (Human Operator Flags Memory After Discovery)
+### What the results do not show
 
-| Attack Scenario | Catch? | Tainted | Base Found | Base Leaked | Graph Found | Graph Leaked | Graph FQ | Outcome |
-|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---|
-| **Compromised High-Trust Source** | **MANUAL** | 2 | 1 | 1 | **2** | **0** | 0 | **Graph recovers 100%** |
-| **Coordinated Multi-Source Lie** | **MANUAL** | 2 | 1 | 1 | **2** | **0** | 0 | **Graph recovers 100%** |
+- The scenarios are scripted, in mock mode, and attack 8 was built to contain reworded outputs. The numbers demonstrate a mechanism. They are not real-world rates.
+- The attack texts for 1, 3, 4 and 5 contain words the Reviewer looks for, so those catches show the pipeline works, not that detection is strong.
 
-### Benchmark Key Findings
-1. **Provenance Traces Derived Taint**: In Attacks 1–5, the baseline text search recovered only the 1 direct output containing the exact poisoned phrase and missed the derived output. The graph layer recovered **100% (2/2)** via traversal.
-2. **Large Blast Radius (Attack 8)**: With 1 poisoned memory feeding 5 direct outputs and 4 derived memories (spanning up to 3 hops) feeding 15 paraphrased outputs without the keyword, baseline text search found only **5/20** (25%), leaving **15 tainted outputs actively serving poison**. The graph layer recovered **20/20 (100%)**, leaving 0 poison active.
-3. **Manual Operator Retraction**: When human operators flag a poisoned memory from an otherwise trusted source, the graph layer successfully cascade-quarantines the entire dependency subtree (100%), while flat keyword baseline misses all rephrased downstream steps.
-4. **Zero False Quarantines**: Across all scenarios, the graph layer touched 0 unrelated clean memories or outputs.
+## 8. Limitations
 
----
+- **Detection is a simple keyword and trust-threshold filter.** The contribution of this project is tracing and cleanup after something is flagged. It is not detection. Attack 2 (harmful instructions with no trigger words), attack 6 (a compromised trusted source) and attack 7 (the same lie from two sources) were all missed automatically.
+- **Compromised trusted sources (attack 6).** Provenance records where data came from. It cannot detect malice from a source the organisation already trusts.
+- **Coordinated multi-source lies (attack 7).** There is no cross-source corroboration. Each memory is judged on its own.
+- **Outputs are dead ends in this model.** If an agent were to turn an output back into a new memory, that link is not tracked, and the blast radius could miss it.
+- **A fact derived from several parents** is quarantined if any parent is bad. This is deliberately cautious and can block good information.
+- **Quarantine cannot undo real-world effects.** If an output already triggered an action or was sent to a user, the system marks it and gives you the list. It cannot take it back.
+- **Mock mode.** The agents do not use a real language model.
 
-## 7. Honest Limitations
+## 9. AI usage and my contributions
 
-No security layer is a silver bullet. We explicitly designed and tested scenarios where automated detection fails:
+### AI usage
 
-1. **Compromised High-Trust Sources (Attack 6 — MISSED in Auto Mode)**:
-   - *Vulnerability*: If an attacker gains write access to an internal architecture Confluence page with an established trust score of `0.95`, automated agents treat the advice as authoritative.
-   - *Why it fails*: Provenance records *where* data came from, but cannot detect semantic malice from an entity the organization inherently trusts.
-   - *Mitigation needed*: Cryptographic content signing, human-in-the-loop signoff for high-impact actions, and anomaly detection on runbook modifications.
+This project was built with AI assistance. **Antigravity** (a Google AI coding assistant) generated most of the code, tests and the first README draft. **Claude** (Anthropic) was used as a chat assistant for brainstorming, explanations, prompt drafting, and drafting wording for some test scenarios and this README.
 
-2. **Coordinated Multi-Source Poisoning / Sybil Collusion (Attack 7 — MISSED in Auto Mode)**:
-   - *Vulnerability*: Two seemingly independent external mirrors publish the exact same malicious DNS recommendation.
-   - *Why it fails*: The automated reviewer inspects single memories independently against heuristic rules and source trust thresholds; it does not implement cross-source corroboration or multi-source consensus verification.
-   - *Mitigation needed*: Cross-domain diversity checking, IP/ASN entity clustering, and external validation against ground-truth telemetry.
+### What I did myself
 
-3. **Delayed Quarantine Lag**:
-   - If an agent output triggered an external action before retraction occurred, the graph quarantines the internal record and prevents further spread, but cannot automatically undo external side-effects that already executed in the real world.
 
----
-
-## 8. AI Usage and My Contributions
-
-### AI Usage Disclosure
-This codebase and its documentation were developed in collaboration with **Antigravity** (Google DeepMind agentic AI coding assistant). Antigravity assisted with scaffolding Pydantic models, writing Cypher query drafts, crafting unit tests, and implementing the Vis.js frontend template.
-
-### My Contributions
-- [ ] TODO: Designed the IT incident response agent memory graph schema (Agent, Memory, Source, Output).
-- [ ] TODO: Formulated the variable-length traversal logic and atomic cascade quarantine Cypher architecture.
-- [ ] TODO: Designed the benchmark attack taxonomy, including intentional failure scenarios for high-trust compromise and sybil collusion.
-- [ ] TODO: Verified and benchmarked the system against a flat memory baseline.
-- [ ] TODO: Evaluated and refined the interactive demo and UI visualization.
+- Chose the problem (poisoned shared memory in multi-agent systems) and the IT incident-response scenario, and decided the scope.
+- Ran the tests, demo, benchmark and web UI myself and checked the results in the FalkorDB browser.
+- Reviewed the benchmark critically. I questioned numbers that looked too good, which led to adding a large fan-out attack (attack 8) and honest failure cases.
+- Checked how the Reviewer decides what to flag and that it never reads the expected-result label.
+- Edited the attack scenarios, including a reworded ticket attack that the Reviewer misses, and updated the tests to match.
+- Corrected stale claims in the documentation, and wrote the problem description in my own words.
